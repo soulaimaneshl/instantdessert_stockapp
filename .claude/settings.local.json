@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh auth *)",
+      "Bash(git init *)",
+      "Bash(gh repo *)",
+      "Bash(git checkout *)",
+      "Bash(touch README.md)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(npm list *)",
+      "Bash(npx bmad-method *)",
+      "Bash(npx bmad-method@latest --help)",
+      "Bash(git push *)",
+      "Bash(gh pr create --title 'chore: initialisation du projet' --body ' *)",
+      "Bash(git stash *)",
+      "Bash(git rm *)"
+    ]
+  }
+}
