@@ -6,9 +6,13 @@ export type EntiteType = 'MATIERE_PREMIERE' | 'PRODUIT_FINI'
 export interface MatierePremiere {
   id: string; nom: string; unite: Unite; categorie: string
   stockActuel: number; seuilTampon: number; prixAchat: number; createdAt: number
+  estPreparation: boolean
 }
+export interface PreparationIngredient { mpIngredientId: string; quantite: number }
+export interface PreparationRecette { preparationId: string; ingredients: PreparationIngredient[] }
 export interface ProduitFini {
   id: string; nom: string; categorie: string; prixVente: number; stockActuel: number; coutDeRevient: number
+  baseProduitId?: string | null
 }
 export interface RecetteIngredient { matierePremiereId: string; quantite: number }
 export interface Recette { produitFiniId: string; ingredients: RecetteIngredient[] }

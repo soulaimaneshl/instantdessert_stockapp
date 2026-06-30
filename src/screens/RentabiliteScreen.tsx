@@ -49,7 +49,7 @@ export default function RentabiliteScreen() {
   const hasAnyData = lignes.length > 0 || allCanaux.length > 0
 
   return (
-    <div className="p-8 flex flex-col gap-6">
+    <div className="p-4 md:p-8 flex flex-col gap-6">
       <div>
         <h1 className="text-2xl font-bold text-text-main">Rentabilité</h1>
         <p className="text-text-sub text-sm">CA total: {caTotalGlobal.toFixed(2)} € · Ventes directes + Site</p>

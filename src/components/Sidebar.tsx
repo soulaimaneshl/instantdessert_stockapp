@@ -1,25 +1,27 @@
 import {
   LayoutDashboard, PlusSquare, Package, Cake,
-  FileText, BookOpen, TrendingUp, Clock, Settings
+  FileText, BookOpen, TrendingUp, Clock, Settings, ChefHat, ScanLine
 } from 'lucide-react'
 
 const nav = [
-  { id: 'accueil', label: 'Accueil', icon: LayoutDashboard },
-  { id: 'production', label: 'Production', icon: PlusSquare },
-  { id: 'stock-mp', label: 'Stock MP', icon: Package },
-  { id: 'produits', label: 'Produits finis', icon: Cake },
-  { id: 'commandes', label: 'Commandes', icon: FileText },
-  { id: 'recettes', label: 'Recettes', icon: BookOpen },
-  { id: 'rentabilite', label: 'Rentabilité', icon: TrendingUp },
-  { id: 'historique', label: 'Historique', icon: Clock },
-  { id: 'parametres', label: 'Paramètres', icon: Settings },
+  { id: 'accueil',       label: 'Accueil',        icon: LayoutDashboard },
+  { id: 'production',    label: 'Production',      icon: PlusSquare },
+  { id: 'preparations',  label: 'Préparations',    icon: ChefHat },
+  { id: 'stock-mp',      label: 'Stock MP',        icon: Package },
+  { id: 'produits',      label: 'Produits finis',  icon: Cake },
+  { id: 'commandes',     label: 'Commandes',       icon: FileText },
+  { id: 'recettes',      label: 'Recettes',        icon: BookOpen },
+  { id: 'rentabilite',   label: 'Rentabilité',     icon: TrendingUp },
+  { id: 'historique',    label: 'Historique',      icon: Clock },
+  { id: 'scanner',       label: 'Scanner ticket',  icon: ScanLine },
+  { id: 'parametres',    label: 'Paramètres',      icon: Settings },
 ]
 
 interface Props { current: string; onChange: (id: string) => void }
 
 export default function Sidebar({ current, onChange }: Props) {
   return (
-    <aside className="w-60 flex flex-col h-screen shrink-0" style={{ background: '#2B1A14' }}>
+    <aside className="hidden md:flex w-60 flex-col h-screen shrink-0" style={{ background: '#2B1A14' }}>
       <div className="relative px-5 py-5 border-b border-white/10 overflow-hidden">
         {/* Décoration haut */}
         <svg viewBox="0 0 240 80" fill="none" xmlns="http://www.w3.org/2000/svg" className="absolute inset-0 w-full h-full opacity-25 pointer-events-none">

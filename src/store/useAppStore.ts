@@ -3,13 +3,14 @@ import { supabase, supabaseAdmin } from '../lib/supabase'
 import type {
   MatierePremiere, ProduitFini, Recette, RecetteIngredient,
   Production, Commande, CommandeLigne, MouvementStock, Canal,
-  CommandeSite
+  CommandeSite, PreparationIngredient, PreparationRecette
 } from '../types'
 
 interface AppStore {
   matieres: MatierePremiere[]
   produits: ProduitFini[]
   recettes: Recette[]
+  preparationRecettes: PreparationRecette[]
   productions: Production[]
   commandes: Commande[]
   commandesSite: CommandeSite[]
@@ -21,6 +22,8 @@ interface AppStore {
   saveMatiere: (data: Omit<MatierePremiere, 'id' | 'createdAt'> & { id?: string }) => Promise<void>
   deleteMatiere: (id: string) => Promise<void>
   ajusterStock: (id: string, delta: number, raison?: string) => Promise<void>
+  savePreparationRecette: (prepId: string, ingredients: PreparationIngredient[]) => Promise<void>
+  produirePreparation: (prepId: string, quantite: number) => Promise<{ ok: boolean; erreur?: string }>
 
   saveProduit: (data: Omit<ProduitFini, 'id' | 'stockActuel' | 'coutDeRevient'> & { id?: string }) => Promise<void>
   deleteProduit: (id: string) => Promise<void>
@@ -30,12 +33,26 @@ interface AppStore {
   produire: (produitId: string, quantite: number) => Promise<{ ok: boolean; erreur?: string }>
   annulerProduction: (productionId: string) => Promise<{ ok: boolean; erreur?: string }>
   modifierProduction: (productionId: string, newProduitId: string, newQuantite: number) => Promise<{ ok: boolean; erreur?: string }>
-  ajusterStockProduit: (produitId: string, delta: number, avecMP: boolean) => Promise<void>
+  ajusterStockProduit: (produitId: string, delta: number, avecMP: boolean, raisonOverride?: string) => Promise<void>
 
   enregistrerCommande: (
     nomClient: string, canal: Canal,
     lignes: { produitId: string; quantite: number; prix: number }[]
   ) => Promise<void>
+
+  preparerCommandeSite: (
+    cmdId: string,
+    source: 'B2C' | 'B2B',
+    matches: { pfId: string; quantite: number }[]
+  ) => Promise<void>
+
+  annulerCommandeSite: (
+    cmdId: string,
+    source: 'B2C' | 'B2B',
+    matches: { pfId: string; quantite: number }[]
+  ) => Promise<void>
+
+  validerCommandeSite: (cmdId: string, source: 'B2C' | 'B2B') => Promise<void>
 }
 
 // Helpers de mapping Supabase → types locaux
@@ -48,6 +65,7 @@ const mpFromRow = (r: Record<string, unknown>): MatierePremiere => ({
   seuilTampon: Number(r.seuil_tampon),
   prixAchat: Number(r.prix_achat),
   createdAt: new Date(r.created_at as string).getTime(),
+  estPreparation: Boolean(r.est_preparation),
 })
 
 const pfFromRow = (r: Record<string, unknown>): ProduitFini => ({
@@ -57,6 +75,7 @@ const pfFromRow = (r: Record<string, unknown>): ProduitFini => ({
   prixVente: Number(r.prix_vente),
   stockActuel: Number(r.stock_actuel),
   coutDeRevient: Number(r.cout_de_revient),
+  baseProduitId: (r.base_produit_id as string) || null,
 })
 
 const mouFromRow = (r: Record<string, unknown>): MouvementStock => ({
@@ -78,17 +97,71 @@ const cmdFromRow = (r: Record<string, unknown>, lignes: CommandeLigne[]): Comman
   createdAt: new Date(r.created_at as string).getTime(),
 })
 
+// Calcule les déductions réelles en cascade :
+// si un ingrédient est une Préparation sans stock → remplace par ses MPs brutes
+function resolveDeductions(
+  ingredients: { mpId: string; quantite: number }[],
+  matieres: MatierePremiere[],
+  preparationRecettes: PreparationRecette[]
+): { mpId: string; delta: number }[] {
+  const result: { mpId: string; delta: number }[] = []
+  for (const { mpId, quantite } of ingredients) {
+    const mp = matieres.find(m => m.id === mpId)
+    if (!mp?.estPreparation || mp.stockActuel >= quantite) {
+      result.push({ mpId, delta: -quantite })
+    } else {
+      const sub = preparationRecettes.find(r => r.preparationId === mpId)
+      if (sub && sub.ingredients.length > 0) {
+        for (const si of sub.ingredients)
+          result.push({ mpId: si.mpIngredientId, delta: -(si.quantite * quantite) })
+      } else {
+        result.push({ mpId, delta: -quantite })
+      }
+    }
+  }
+  return result
+}
+
+// Vérifie la faisabilité avec cascade
+function checkDeductions(
+  ingredients: { mpId: string; quantite: number }[],
+  matieres: MatierePremiere[],
+  preparationRecettes: PreparationRecette[]
+): { ok: boolean; erreur?: string } {
+  for (const { mpId, quantite } of ingredients) {
+    const mp = matieres.find(m => m.id === mpId)
+    if (!mp?.estPreparation) {
+      if (!mp || mp.stockActuel < quantite)
+        return { ok: false, erreur: `Stock insuffisant: ${mp?.nom ?? '?'} (dispo: ${mp?.stockActuel ?? 0}, requis: ${quantite})` }
+    } else if (mp.stockActuel >= quantite) {
+      continue
+    } else {
+      const sub = preparationRecettes.find(r => r.preparationId === mpId)
+      if (!sub || sub.ingredients.length === 0)
+        return { ok: false, erreur: `${mp.nom} insuffisant(e) (stock: ${mp.stockActuel}) — aucune recette de secours configurée` }
+      for (const si of sub.ingredients) {
+        const subMp = matieres.find(m => m.id === si.mpIngredientId)
+        const requis = si.quantite * quantite
+        if (!subMp || subMp.stockActuel < requis)
+          return { ok: false, erreur: `Impossible de fabriquer ${mp.nom}: ${subMp?.nom ?? '?'} insuffisant (dispo: ${subMp?.stockActuel ?? 0}, requis: ${requis})` }
+      }
+    }
+  }
+  return { ok: true }
+}
+
 export const useAppStore = create<AppStore>((set, get) => ({
-  matieres: [], produits: [], recettes: [],
+  matieres: [], produits: [], recettes: [], preparationRecettes: [],
   productions: [], commandes: [], commandesSite: [], mouvements: [],
   loading: false,
 
   loadAll: async () => {
     set({ loading: true })
-    const [mpRes, pfRes, riRes, prodRes, mvtRes, ventesRes, lignesRes, b2cRes, b2cItemsRes, b2bRes, b2bItemsRes] = await Promise.all([
+    const [mpRes, pfRes, riRes, prepIngRes, prodRes, mvtRes, ventesRes, lignesRes, b2cRes, b2cItemsRes, b2bRes, b2bItemsRes] = await Promise.all([
       supabase.from('matieres_premieres').select('*').order('created_at'),
       supabase.from('produits_finis').select('*').order('created_at'),
       supabase.from('recette_ingredients').select('*'),
+      supabase.from('preparation_ingredients').select('*'),
       supabase.from('productions').select('*').order('created_at', { ascending: false }),
       supabase.from('mouvements_stock').select('*').order('created_at', { ascending: false }),
       supabase.from('ventes_directes').select('*').order('created_at', { ascending: false }),
@@ -112,6 +185,17 @@ export const useAppStore = create<AppStore>((set, get) => ({
     const recettes: Recette[] = Object.entries(riMap).map(([produitFiniId, ingredients]) => ({
       produitFiniId,
       ingredients,
+    }))
+
+    // Recettes des préparations
+    const prepIngMap: Record<string, PreparationIngredient[]> = {}
+    for (const r of (prepIngRes.data ?? [])) {
+      const pid = r.preparation_id as string
+      if (!prepIngMap[pid]) prepIngMap[pid] = []
+      prepIngMap[pid].push({ mpIngredientId: r.mp_ingredient_id as string, quantite: Number(r.quantite) })
+    }
+    const preparationRecettes: PreparationRecette[] = Object.entries(prepIngMap).map(([preparationId, ingredients]) => ({
+      preparationId, ingredients
     }))
 
     const productions: Production[] = (prodRes.data ?? []).map(r => ({
@@ -175,13 +259,44 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
     const commandesSite = [...commandesB2C, ...commandesB2B].sort((a, b) => b.createdAt - a.createdAt)
 
-    set({ matieres, produits, recettes, productions, mouvements, commandes, commandesSite, loading: false })
+    // Auto-restauration des commandes annulées par le site (stock déduit lors de la préparation)
+    const restoredRaisons = new Set<string>()
+    for (const cmd of commandesSite.filter(c => ['annulee', 'annule'].includes(c.statut))) {
+      const raison = `Commande site #${cmd.id.slice(0, 8)}`
+      const relatedMvts = mouvements.filter(m => m.raison === raison && m.delta < 0)
+      if (relatedMvts.length === 0) continue
+      for (const mvt of relatedMvts) {
+        if (mvt.entiteType === 'MATIERE_PREMIERE') {
+          const idx = matieres.findIndex(m => m.id === mvt.entiteId)
+          if (idx >= 0) {
+            const newStock = Math.max(0, matieres[idx].stockActuel + Math.abs(mvt.delta))
+            matieres[idx] = { ...matieres[idx], stockActuel: newStock }
+            await supabase.from('matieres_premieres').update({ stock_actuel: newStock }).eq('id', mvt.entiteId)
+          }
+        } else if (mvt.entiteType === 'PRODUIT_FINI') {
+          const idx = produits.findIndex(p => p.id === mvt.entiteId)
+          if (idx >= 0) {
+            const newStock = Math.max(0, produits[idx].stockActuel + Math.abs(mvt.delta))
+            produits[idx] = { ...produits[idx], stockActuel: newStock }
+            await supabase.from('produits_finis').update({ stock_actuel: newStock }).eq('id', mvt.entiteId)
+          }
+        }
+      }
+      await supabase.from('mouvements_stock').delete().eq('raison', raison).lt('delta', 0)
+      restoredRaisons.add(raison)
+    }
+    const mouvementsFinal = mouvements.filter(m => !(restoredRaisons.has(m.raison ?? '') && m.delta < 0))
+    // Ne jamais afficher les commandes annulées (stock déjà restauré ci-dessus ou jamais préparées)
+    const commandesSiteVisible = commandesSite.filter(c => !['annulee', 'annule'].includes(c.statut))
+
+    set({ matieres, produits, recettes, preparationRecettes, productions, mouvements: mouvementsFinal, commandes, commandesSite: commandesSiteVisible, loading: false })
   },
 
   saveMatiere: async (data) => {
     const row = {
       nom: data.nom, unite: data.unite,
       stock_actuel: data.stockActuel, seuil_tampon: data.seuilTampon, prix_achat: data.prixAchat,
+      est_preparation: data.estPreparation ?? false,
     }
     if (data.id) {
       await supabase.from('matieres_premieres').update(row).eq('id', data.id)
@@ -213,7 +328,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   saveProduit: async (data) => {
-    const row = { nom: data.nom, prix_vente: data.prixVente }
+    const row = { nom: data.nom, prix_vente: data.prixVente, base_produit_id: data.baseProduitId ?? null }
     if (data.id) {
       await supabase.from('produits_finis').update(row).eq('id', data.id)
       set(s => ({ produits: s.produits.map(p => p.id === data.id ? { ...p, ...data } : p) }))
@@ -261,40 +376,41 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   produire: async (produitId, quantite) => {
-    const { matieres, recettes, produits } = get()
+    const { matieres, recettes, produits, preparationRecettes } = get()
     const recette = recettes.find(r => r.produitFiniId === produitId)
     const produit = produits.find(p => p.id === produitId)
     if (!produit) return { ok: false, erreur: 'Produit introuvable' }
 
     if (recette) {
-      for (const ing of recette.ingredients) {
-        const mp = matieres.find(m => m.id === ing.matierePremiereId)
-        const requis = ing.quantite * quantite
-        if (!mp || mp.stockActuel < requis) {
-          return { ok: false, erreur: `Stock insuffisant: ${mp?.nom ?? '?'} (dispo: ${mp?.stockActuel ?? 0}, requis: ${requis})` }
+      const check = checkDeductions(
+        recette.ingredients.map(i => ({ mpId: i.matierePremiereId, quantite: i.quantite * quantite })),
+        matieres, preparationRecettes
+      )
+      if (!check.ok) return { ok: false, erreur: check.erreur }
+    }
+
+    const newMatieres = [...matieres]
+    const mvtInserts: object[] = []
+    if (recette) {
+      // Résoudre la cascade : préparation en stock → déduire direct ; épuisée → déduire ses MPs brutes
+      const deductions = resolveDeductions(
+        recette.ingredients.map(i => ({ mpId: i.matierePremiereId, quantite: i.quantite * quantite })),
+        matieres, preparationRecettes
+      )
+      for (const { mpId, delta } of deductions) {
+        const idx = newMatieres.findIndex(m => m.id === mpId)
+        if (idx >= 0) {
+          newMatieres[idx] = { ...newMatieres[idx], stockActuel: Math.max(0, newMatieres[idx].stockActuel + delta) }
+          await supabase.from('matieres_premieres').update({ stock_actuel: newMatieres[idx].stockActuel }).eq('id', mpId)
+          mvtInserts.push({ type: 'PRODUCTION', entite_id: mpId, entite_type: 'MATIERE_PREMIERE', delta, raison: `Production: ${produit.nom} ×${quantite}` })
         }
       }
     }
 
-    // Décrémenter les MPs
-    const newMatieres = [...matieres]
-    const mvtInserts: object[] = []
-    if (recette) {
-      for (const ing of recette.ingredients) {
-        const requis = ing.quantite * quantite
-        const idx = newMatieres.findIndex(m => m.id === ing.matierePremiereId)
-        if (idx >= 0) newMatieres[idx] = { ...newMatieres[idx], stockActuel: newMatieres[idx].stockActuel - requis }
-        await supabase.from('matieres_premieres').update({ stock_actuel: newMatieres[idx].stockActuel }).eq('id', ing.matierePremiereId)
-        mvtInserts.push({ type: 'PRODUCTION', entite_id: ing.matierePremiereId, entite_type: 'MATIERE_PREMIERE', delta: -requis, raison: `Production: ${produit.nom} ×${quantite}` })
-      }
-    }
-
-    // Incrémenter le PF
     const newStock = produit.stockActuel + quantite
     await supabase.from('produits_finis').update({ stock_actuel: newStock }).eq('id', produitId)
     mvtInserts.push({ type: 'PRODUCTION', entite_id: produitId, entite_type: 'PRODUIT_FINI', delta: quantite, raison: `Production ×${quantite}` })
 
-    // Enregistrer production + mouvements
     await supabase.from('productions').insert({ produit_fini_id: produitId, quantite })
     const { data: newMvts } = await supabase.from('mouvements_stock').insert(mvtInserts).select()
 
@@ -415,22 +531,28 @@ export const useAppStore = create<AppStore>((set, get) => ({
     return { ok: true }
   },
 
-  ajusterStockProduit: async (produitId, delta, avecMP) => {
+  ajusterStockProduit: async (produitId, delta, avecMP, raisonOverride) => {
     const { matieres, recettes, produits } = get()
     const produit = produits.find(p => p.id === produitId)
     if (!produit) return
-    const newStock = Math.max(0, produit.stockActuel + delta)
-    await supabase.from('produits_finis').update({ stock_actuel: newStock }).eq('id', produitId)
+
+    // Si c'est une variante, la déduction de stock va sur le produit de base
+    const effectifId = produit.baseProduitId ?? produitId
+    const effectif = produits.find(p => p.id === effectifId) ?? produit
+
+    const newStock = Math.max(0, effectif.stockActuel + delta)
+    await supabase.from('produits_finis').update({ stock_actuel: newStock }).eq('id', effectifId)
 
     const mvtInserts: object[] = [{
       type: delta >= 0 ? 'PRODUCTION' : 'CORRECTION_MP',
-      entite_id: produitId, entite_type: 'PRODUIT_FINI', delta,
-      raison: `Ajustement manuel ×${Math.abs(delta)}`,
+      entite_id: effectifId, entite_type: 'PRODUIT_FINI', delta,
+      raison: raisonOverride ?? `Ajustement manuel ×${Math.abs(delta)}`,
     }]
 
     const newMatieres = [...matieres]
     if (avecMP && delta !== 0) {
-      const recette = recettes.find(r => r.produitFiniId === produitId)
+      // Cherche la recette sur la variante d'abord (toppings), sinon sur la base
+      const recette = recettes.find(r => r.produitFiniId === produitId) ?? recettes.find(r => r.produitFiniId === effectifId)
       if (recette) {
         for (const ing of recette.ingredients) {
           const consommation = ing.quantite * delta
@@ -442,7 +564,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
             mvtInserts.push({
               type: delta >= 0 ? 'PRODUCTION' : 'CORRECTION_MP',
               entite_id: ing.matierePremiereId, entite_type: 'MATIERE_PREMIERE',
-              delta: -consommation, raison: `Ajustement manuel: ${produit.nom}`,
+              delta: -consommation, raison: `Ajustement: ${effectif.nom}`,
             })
           }
         }
@@ -452,34 +574,176 @@ export const useAppStore = create<AppStore>((set, get) => ({
     const { data: newMvts } = await supabase.from('mouvements_stock').insert(mvtInserts).select()
     set(s => ({
       matieres: newMatieres,
-      produits: s.produits.map(p => p.id === produitId ? { ...p, stockActuel: newStock } : p),
+      produits: s.produits.map(p => p.id === effectifId ? { ...p, stockActuel: newStock } : p),
       mouvements: [...(newMvts ?? []).map(m => mouFromRow(m as Record<string, unknown>)), ...s.mouvements],
     }))
   },
 
+  savePreparationRecette: async (prepId, ingredients) => {
+    await supabase.from('preparation_ingredients').delete().eq('preparation_id', prepId)
+    if (ingredients.length > 0) {
+      await supabase.from('preparation_ingredients').insert(
+        ingredients.map(i => ({ preparation_id: prepId, mp_ingredient_id: i.mpIngredientId, quantite: i.quantite }))
+      )
+    }
+    // Auto-calcul du prix unitaire depuis les ingrédients
+    const matieres = get().matieres
+    const cout = ingredients.reduce((sum, ing) => {
+      const mp = matieres.find(m => m.id === ing.mpIngredientId)
+      return sum + (mp?.prixAchat ?? 0) * ing.quantite
+    }, 0)
+    if (cout > 0) {
+      await supabase.from('matieres_premieres').update({ prix_achat: cout }).eq('id', prepId)
+      set(s => ({ matieres: s.matieres.map(m => m.id === prepId ? { ...m, prixAchat: cout } : m) }))
+    }
+    set(s => ({
+      preparationRecettes: [
+        ...s.preparationRecettes.filter(r => r.preparationId !== prepId),
+        { preparationId: prepId, ingredients },
+      ]
+    }))
+  },
+
+  produirePreparation: async (prepId, quantite) => {
+    const { matieres, preparationRecettes } = get()
+    const prep = matieres.find(m => m.id === prepId)
+    if (!prep) return { ok: false, erreur: 'Préparation introuvable' }
+    const recette = preparationRecettes.find(r => r.preparationId === prepId)
+    if (recette) {
+      for (const ing of recette.ingredients) {
+        const mp = matieres.find(m => m.id === ing.mpIngredientId)
+        const requis = ing.quantite * quantite
+        if (!mp || mp.stockActuel < requis) {
+          return { ok: false, erreur: `Stock insuffisant : ${mp?.nom ?? '?'} (dispo: ${mp?.stockActuel ?? 0}, requis: ${requis})` }
+        }
+      }
+      for (const ing of recette.ingredients) {
+        await get().ajusterStock(ing.mpIngredientId, -(ing.quantite * quantite), `Prod. ${prep.nom} ×${quantite}`)
+      }
+    }
+    await get().ajusterStock(prepId, quantite, `Prod. ${prep.nom} ×${quantite}`)
+    return { ok: true }
+  },
+
+  preparerCommandeSite: async (cmdId, source, matches) => {
+    const { recettes, produits, preparationRecettes } = get()
+    const raison = `Commande site #${cmdId.slice(0, 8)}`
+
+    for (const { pfId, quantite } of matches) {
+      const pf = produits.find(p => p.id === pfId)
+      const recette = recettes.find(r => r.produitFiniId === pfId)
+
+      if (pf?.baseProduitId) {
+        // VARIANTE → déduire stock de base + ingrédients variante avec cascade
+        await get().ajusterStockProduit(pf.baseProduitId, -quantite, false, raison)
+        if (recette) {
+          const deductions = resolveDeductions(
+            recette.ingredients.map(i => ({ mpId: i.matierePremiereId, quantite: i.quantite * quantite })),
+            get().matieres, preparationRecettes
+          )
+          for (const { mpId, delta } of deductions)
+            await get().ajusterStock(mpId, delta, raison)
+        }
+      } else if (recette) {
+        // BASE avec recette → déduire ingrédients avec cascade (prep épuisée = utilise ses MPs)
+        const deductions = resolveDeductions(
+          recette.ingredients.map(i => ({ mpId: i.matierePremiereId, quantite: i.quantite * quantite })),
+          get().matieres, preparationRecettes
+        )
+        for (const { mpId, delta } of deductions)
+          await get().ajusterStock(mpId, delta, raison)
+      } else {
+        // Pré-fait sans recette → déduire le stock directement
+        await get().ajusterStockProduit(pfId, -quantite, false, raison)
+      }
+    }
+    const table = source === 'B2C' ? 'orders_b2c' : 'orders_b2b'
+    await supabaseAdmin.from(table).update({ statut: 'en_preparation' }).eq('id', cmdId)
+    set(s => ({
+      commandesSite: s.commandesSite.map(c => c.id === cmdId ? { ...c, statut: 'en_preparation' } : c)
+    }))
+  },
+
+  annulerCommandeSite: async (cmdId, source, matches) => {
+    const { recettes, produits, preparationRecettes } = get()
+    const raison = `Annulation commande #${cmdId.slice(0, 8)}`
+
+    for (const { pfId, quantite } of matches) {
+      const pf = produits.find(p => p.id === pfId)
+      const recette = recettes.find(r => r.produitFiniId === pfId)
+
+      if (pf?.baseProduitId) {
+        // Variante → remettre stock de base + ingrédients variante
+        await get().ajusterStockProduit(pf.baseProduitId, quantite, false)
+        if (recette) {
+          const deductions = resolveDeductions(
+            recette.ingredients.map(i => ({ mpId: i.matierePremiereId, quantite: i.quantite * quantite })),
+            get().matieres, preparationRecettes
+          )
+          for (const { mpId, delta } of deductions)
+            await get().ajusterStock(mpId, -delta, raison)
+        }
+      } else if (recette) {
+        // Base avec recette → remettre les ingrédients
+        const deductions = resolveDeductions(
+          recette.ingredients.map(i => ({ mpId: i.matierePremiereId, quantite: i.quantite * quantite })),
+          get().matieres, preparationRecettes
+        )
+        for (const { mpId, delta } of deductions)
+          await get().ajusterStock(mpId, -delta, raison)
+      } else {
+        // Pré-fait → remettre le stock PF
+        await get().ajusterStockProduit(pfId, quantite, false)
+      }
+    }
+
+    const table = source === 'B2C' ? 'orders_b2c' : 'orders_b2b'
+    await supabaseAdmin.from(table).update({ statut: 'annulee' }).eq('id', cmdId)
+    set(s => ({
+      commandesSite: s.commandesSite.map(c => c.id === cmdId ? { ...c, statut: 'annulee' } : c)
+    }))
+  },
+
+  validerCommandeSite: async (cmdId, source) => {
+    const table = source === 'B2C' ? 'orders_b2c' : 'orders_b2b'
+    await supabaseAdmin.from(table).update({ statut: 'traitee' }).eq('id', cmdId)
+    set(s => ({
+      commandesSite: s.commandesSite.map(c => c.id === cmdId ? { ...c, statut: 'traitee' } : c)
+    }))
+  },
+
   enregistrerCommande: async (nomClient, canal, lignes) => {
+    const { produits } = get()
     const total = lignes.reduce((s, l) => s + l.prix * l.quantite, 0)
     const { data: vente } = await supabase.from('ventes_directes').insert({ nom_client: nomClient, canal, total }).select().single()
     if (!vente) return
     await supabase.from('vente_lignes').insert(
       lignes.map(l => ({ vente_id: vente.id, produit_fini_id: l.produitId, quantite: l.quantite, prix_unitaire: l.prix }))
     )
-    // Décrémenter stock PF + mouvements
-    const mvtInserts = lignes.map(l => ({ type: 'VENTE', entite_id: l.produitId, entite_type: 'PRODUIT_FINI', delta: -l.quantite, raison: `Vente: ${nomClient}` }))
-    for (const l of lignes) {
-      const p = get().produits.find(p => p.id === l.produitId)
-      if (p) await supabase.from('produits_finis').update({ stock_actuel: Math.max(0, p.stockActuel - l.quantite) }).eq('id', l.produitId)
-    }
-    const { data: newMvts } = await supabase.from('mouvements_stock').insert(mvtInserts).select()
 
+    // Regrouper les déductions par produit effectif (base si variante)
+    const stockUpdates = new Map<string, number>()
+    for (const l of lignes) {
+      const p = produits.find(p => p.id === l.produitId)
+      const effectifId = p?.baseProduitId ?? l.produitId
+      stockUpdates.set(effectifId, (stockUpdates.get(effectifId) ?? 0) + l.quantite)
+    }
+
+    const mvtInserts = lignes.map(l => ({ type: 'VENTE', entite_id: l.produitId, entite_type: 'PRODUIT_FINI', delta: -l.quantite, raison: `Vente: ${nomClient}` }))
+    for (const [effectifId, totalQte] of stockUpdates) {
+      const p = produits.find(p => p.id === effectifId)
+      if (p) await supabase.from('produits_finis').update({ stock_actuel: Math.max(0, p.stockActuel - totalQte) }).eq('id', effectifId)
+    }
+
+    const { data: newMvts } = await supabase.from('mouvements_stock').insert(mvtInserts).select()
     const cmdLignes: CommandeLigne[] = lignes.map(l => ({ produitFiniId: l.produitId, quantite: l.quantite, prixUnitaireSnapshot: l.prix }))
     const commande = cmdFromRow(vente as Record<string, unknown>, cmdLignes)
 
     set(s => ({
       commandes: [commande, ...s.commandes],
       produits: s.produits.map(p => {
-        const l = lignes.find(l => l.produitId === p.id)
-        return l ? { ...p, stockActuel: Math.max(0, p.stockActuel - l.quantite) } : p
+        const delta = stockUpdates.get(p.id)
+        return delta ? { ...p, stockActuel: Math.max(0, p.stockActuel - delta) } : p
       }),
       mouvements: [...(newMvts ?? []).map(m => mouFromRow(m as Record<string, unknown>)), ...s.mouvements],
     }))

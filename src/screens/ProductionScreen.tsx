@@ -96,7 +96,7 @@ export default function ProductionScreen() {
   const sortedProductions = [...productions].sort((a, b) => b.createdAt - a.createdAt)
 
   return (
-    <div className="p-8 flex flex-col gap-8">
+    <div className="p-4 md:p-8 flex flex-col gap-8">
       <div>
         <h1 className="text-2xl font-bold text-text-main">Production</h1>
         <p className="text-text-sub text-sm">Lancer et gérer les productions</p>

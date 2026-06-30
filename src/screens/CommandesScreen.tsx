@@ -1,5 +1,6 @@
 import { useState } from 'react'
-import { Plus, Trash2 } from 'lucide-react'
+import { Plus, Trash2, ChefHat, CheckCircle } from 'lucide-react'
+// Trash2 utilisé dans NouvelleCommandeModal pour retirer une ligne
 import Modal from '../components/Modal'
 import { useAppStore } from '../store/useAppStore'
 import type { Canal, CommandeSite } from '../types'
@@ -17,20 +18,105 @@ const STATUT_STYLE: Record<string, string> = {
   annule:         'bg-danger-light text-danger',
   annulee:        'bg-danger-light text-danger',
   recue:          'bg-warning-light text-warning',
+  traitee:        'bg-success-light text-success',
 }
 
 const STATUT_LABEL: Record<string, string> = {
   en_attente: 'En attente', en_preparation: 'En préparation',
   en_livraison: 'En livraison', livre: 'Livré', livree: 'Livrée',
   annule: 'Annulé', annulee: 'Annulée', recue: 'Reçue',
+  traitee: 'Traitée ✓',
 }
 
-function CommandeSiteCard({ cmd }: { cmd: CommandeSite }) {
+const STATUT_TERMINAL = new Set(['livree', 'livre', 'annule', 'annulee', 'traitee'])
+
+function PrepareModal({ cmd, onClose }: { cmd: CommandeSite; onClose: () => void }) {
+  const { produits, recettes, preparerCommandeSite } = useAppStore()
+  const [matches, setMatches] = useState<Record<number, string>>(() => {
+    const init: Record<number, string> = {}
+    cmd.lignes.forEach((l, i) => {
+      const ln = l.nom.toLowerCase()
+      const match = produits.find(p => {
+        const pn = p.nom.toLowerCase()
+        return pn === ln || ln.includes(pn) || pn.includes(ln.split(' ')[0])
+      })
+      if (match) init[i] = match.id
+    })
+    return init
+  })
+  const [loading, setLoading] = useState(false)
+
+  const handleConfirm = async () => {
+    setLoading(true)
+    const validMatches = Object.entries(matches)
+      .filter(([, pfId]) => pfId)
+      .map(([i, pfId]) => ({ pfId, quantite: cmd.lignes[+i].quantite }))
+    await preparerCommandeSite(cmd.id, cmd.source, validMatches)
+    setLoading(false)
+    onClose()
+  }
+
+  return (
+    <Modal title={`Préparer — ${cmd.nomClient}`} onClose={onClose}
+      footer={
+        <>
+          <button onClick={onClose} className="px-4 py-2 rounded-lg text-text-sub hover:bg-gray-100">Annuler</button>
+          <button onClick={handleConfirm} disabled={loading}
+            className="px-4 py-2 bg-accent text-white rounded-lg font-medium disabled:opacity-40">
+            {loading ? 'En cours…' : 'Confirmer préparation'}
+          </button>
+        </>
+      }>
+      <p className="text-xs text-text-sub bg-accent-light rounded-lg px-3 py-2">
+        Associez chaque article à un produit du stock. Si le produit a une recette, les ingrédients (base + toppings) seront déduits automatiquement. Sinon, c'est le stock du produit fini qui diminue.
+      </p>
+      <div className="flex flex-col gap-3">
+        {cmd.lignes.map((l, i) => {
+          const pfId = matches[i] ?? ''
+          const pf = produits.find(p => p.id === pfId)
+          const aRecette = pf && recettes.some(r => r.produitFiniId === pfId)
+          return (
+            <div key={i} className="bg-gray-50 rounded-lg p-3 flex flex-col gap-2">
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-sm text-text-main">{l.nom}</span>
+                <span className="text-xs bg-gray-200 text-text-sub px-2 py-0.5 rounded-full font-medium">×{l.quantite}</span>
+              </div>
+              <select value={pfId} onChange={e => setMatches({ ...matches, [i]: e.target.value })}
+                className="border border-border rounded-lg px-3 py-2 text-sm bg-white">
+                <option value="">— Ignorer —</option>
+                {produits.map(p => (
+                  <option key={p.id} value={p.id}>
+                    {p.nom}{p.stockActuel > 0 ? ` (stock: ${p.stockActuel})` : ''}
+                  </option>
+                ))}
+              </select>
+              {pfId && (
+                <p className="text-xs text-success font-medium">
+                  {aRecette
+                    ? '→ Recette : ingrédients déduits automatiquement'
+                    : `→ Stock déduit : ${l.quantite} unité(s) de "${pf?.nom}"`}
+                </p>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </Modal>
+  )
+}
+
+function CommandeSiteCard({ cmd, onPrepare, onValider }: {
+  cmd: CommandeSite
+  onPrepare: (cmd: CommandeSite) => void
+  onValider: () => void
+}) {
+  const canPrepare = !['livree', 'livre', 'annule', 'annulee', 'en_preparation', 'traitee'].includes(cmd.statut)
+  const canValider = cmd.statut === 'en_preparation'
   return (
     <div className="bg-white rounded-xl border border-border p-4">
-      <div className="flex items-start justify-between">
-        <div>
-          <div className="flex items-center gap-2 mb-1">
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 mb-1 flex-wrap">
             <span className={`text-xs font-bold px-2 py-0.5 rounded ${cmd.source === 'B2C' ? 'bg-accent text-white' : 'bg-text-main text-white'}`}>
               {cmd.source === 'B2C' ? 'Particulier' : 'Restaurant'}
             </span>
@@ -44,7 +130,21 @@ function CommandeSiteCard({ cmd }: { cmd: CommandeSite }) {
             {' · '}#{cmd.id.slice(0, 8).toUpperCase()}
           </p>
         </div>
-        <p className="font-bold text-accent">{cmd.total.toFixed(2)} €</p>
+        <div className="flex flex-col items-end gap-2 shrink-0">
+          <p className="font-bold text-accent">{cmd.total.toFixed(2)} €</p>
+          {canPrepare && (
+            <button onClick={() => onPrepare(cmd)}
+              className="flex items-center gap-1.5 text-xs font-semibold bg-accent text-white px-3 py-1.5 rounded-lg hover:bg-accent/90 transition-colors">
+              <ChefHat size={13} /> Préparer
+            </button>
+          )}
+          {canValider && (
+            <button onClick={onValider}
+              className="flex items-center gap-1.5 text-xs font-semibold bg-success text-white px-3 py-1.5 rounded-lg hover:bg-success/90 transition-colors">
+              <CheckCircle size={13} /> Valider
+            </button>
+          )}
+        </div>
       </div>
       <div className="mt-3 flex flex-wrap gap-2">
         {cmd.lignes.map((l, i) => (
@@ -115,7 +215,11 @@ function NouvelleCommandeModal({ onClose }: { onClose: () => void }) {
       <div className="flex gap-2">
         <select value={selectedProduit} onChange={e => setSelectedProduit(e.target.value)}
           className="flex-1 border border-border rounded-lg px-3 py-2 text-sm bg-white">
-          {produits.map(p => <option key={p.id} value={p.id}>{p.nom} (stock: {p.stockActuel})</option>)}
+          {produits.map(p => {
+            const base = p.baseProduitId ? produits.find(b => b.id === p.baseProduitId) : null
+            const displayStock = base ? base.stockActuel : p.stockActuel
+            return <option key={p.id} value={p.id}>{p.nom} (stock: {displayStock})</option>
+          })}
         </select>
         <input type="number" min="1" value={qte} onChange={e => setQte(e.target.value)}
           className="w-20 border border-border rounded-lg px-3 py-2 text-sm" />
@@ -143,16 +247,26 @@ function NouvelleCommandeModal({ onClose }: { onClose: () => void }) {
 }
 
 export default function CommandesScreen() {
-  const { commandes, commandesSite, produits } = useAppStore()
+  const { commandes, commandesSite, produits, validerCommandeSite } = useAppStore()
   const [showNew, setShowNew] = useState(false)
   const [tab, setTab] = useState<'site' | 'directes'>('site')
+  const [preparing, setPreparing] = useState<CommandeSite | null>(null)
 
   const caDirectes = commandes.reduce((s, c) => s + c.total, 0)
+  // Les commandes annulées sont filtrées par loadAll, donc toutes les commandesSite sont valides
   const caSite = commandesSite.reduce((s, c) => s + c.total, 0)
   const pendingSite = commandesSite.filter(c => ['en_attente', 'recue', 'en_preparation'].includes(c.statut)).length
 
+  // Tri : actives en premier (plus anciennes d'abord), terminales ensuite
+  const commandesSiteTried = [...commandesSite].sort((a, b) => {
+    const aTerminal = STATUT_TERMINAL.has(a.statut)
+    const bTerminal = STATUT_TERMINAL.has(b.statut)
+    if (aTerminal !== bTerminal) return aTerminal ? 1 : -1
+    return a.createdAt - b.createdAt
+  })
+
   return (
-    <div className="p-8 flex flex-col gap-6">
+    <div className="p-4 md:p-8 flex flex-col gap-6">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold text-text-main">Commandes</h1>
@@ -180,11 +294,14 @@ export default function CommandesScreen() {
       {tab === 'site' ? (
         <div className="flex flex-col gap-3">
           <div className="bg-accent-light rounded-xl px-4 py-3 flex justify-between items-center">
-            <p className="text-sm text-accent font-medium">{commandesSite.length} commande(s) reçues du site</p>
-            <p className="font-bold text-accent">{caSite.toFixed(2)} €</p>
+            <p className="text-sm text-accent font-medium">{commandesSite.length} commande(s) · {pendingSite} en cours</p>
+            <p className="font-bold text-accent">{caSite.toFixed(2)} € <span className="text-xs font-normal">(hors annulées)</span></p>
           </div>
           {commandesSite.length === 0 && <p className="text-text-sub text-center py-12">Aucune commande du site.</p>}
-          {commandesSite.map(cmd => <CommandeSiteCard key={cmd.id} cmd={cmd} />)}
+          {commandesSiteTried.map(cmd => (
+            <CommandeSiteCard key={cmd.id} cmd={cmd} onPrepare={setPreparing}
+              onValider={() => validerCommandeSite(cmd.id, cmd.source)} />
+          ))}
         </div>
       ) : (
         <div className="flex flex-col gap-3">
@@ -220,6 +337,7 @@ export default function CommandesScreen() {
       )}
 
       {showNew && <NouvelleCommandeModal onClose={() => setShowNew(false)} />}
+      {preparing && <PrepareModal cmd={preparing} onClose={() => setPreparing(null)} />}
     </div>
   )
 }

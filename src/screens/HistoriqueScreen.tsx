@@ -76,7 +76,7 @@ export default function HistoriqueScreen() {
   ].sort((a, b) => b.data.createdAt - a.data.createdAt)
 
   return (
-    <div className="p-8 flex flex-col gap-6">
+    <div className="p-4 md:p-8 flex flex-col gap-6">
       <div>
         <h1 className="text-2xl font-bold text-text-main">Historique</h1>
         <p className="text-text-sub text-sm">{entries.length} / {mouvements.length + commandesSite.length} événement(s)</p>

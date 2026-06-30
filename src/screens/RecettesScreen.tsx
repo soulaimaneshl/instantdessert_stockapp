@@ -1,6 +1,7 @@
 import { useState, useMemo } from 'react'
 import { Plus, Pencil, Trash2, Search, ChevronDown, ChevronUp } from 'lucide-react'
 import Modal from '../components/Modal'
+import QuantiteInput from '../components/QuantiteInput'
 import { useAppStore } from '../store/useAppStore'
 import type { RecetteIngredient } from '../types'
 
@@ -15,9 +16,10 @@ function RecetteModal({ produitId, onClose }: { produitId: string; onClose: () =
   const [qte, setQte] = useState('')
   const [searchMP, setSearchMP] = useState('')
 
-  const matieresFiltrees = matieres.filter(m =>
-    searchMP === '' || m.nom.toLowerCase().includes(searchMP.toLowerCase())
-  )
+  const rawMPs = matieres.filter(m => !m.estPreparation &&
+    (searchMP === '' || m.nom.toLowerCase().includes(searchMP.toLowerCase())))
+  const preparations = matieres.filter(m => m.estPreparation &&
+    (searchMP === '' || m.nom.toLowerCase().includes(searchMP.toLowerCase())))
 
   const addIngr = () => {
     const id = selectedMP
@@ -43,18 +45,31 @@ function RecetteModal({ produitId, onClose }: { produitId: string; onClose: () =
       <div className="relative">
         <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-text-sub" />
         <input value={searchMP} onChange={e => setSearchMP(e.target.value)}
-          placeholder="Filtrer les MP..."
+          placeholder="Filtrer les ingrédients..."
           className="w-full pl-8 pr-3 py-2 border border-border rounded-lg text-sm focus:outline-none focus:border-accent" />
       </div>
       <div className="flex gap-2">
-        <select value={selectedMP} onChange={e => setSelectedMP(e.target.value)}
+        <select value={selectedMP} onChange={e => { setSelectedMP(e.target.value); setQte('') }}
           className="flex-1 border border-border rounded-lg px-3 py-2 text-sm bg-white">
-          {matieresFiltrees.map(m => <option key={m.id} value={m.id}>{m.nom} ({m.unite})</option>)}
+          {preparations.length > 0 && (
+            <optgroup label="— Préparations (semi-finies) —">
+              {preparations.map(m => (
+                <option key={m.id} value={m.id}>{m.nom} (unité)</option>
+              ))}
+            </optgroup>
+          )}
+          <optgroup label="— Matières premières brutes —">
+            {rawMPs.map(m => <option key={m.id} value={m.id}>{m.nom} ({m.unite})</option>)}
+          </optgroup>
         </select>
-        <input type="number" value={qte} onChange={e => setQte(e.target.value)} placeholder="Qté"
-          className="w-24 border border-border rounded-lg px-3 py-2 text-sm" />
-        <button onClick={addIngr} className="p-2 bg-accent text-white rounded-lg"><Plus size={16} /></button>
+        <button onClick={addIngr} className="p-2 bg-accent text-white rounded-lg shrink-0"><Plus size={16} /></button>
       </div>
+      {(() => {
+        const mp = matieres.find(m => m.id === selectedMP)
+        return mp ? (
+          <QuantiteInput unite={mp.unite} value={qte} onChange={setQte} placeholder="Quantité" />
+        ) : null
+      })()}
 
       <div className="flex flex-col gap-2 max-h-48 overflow-y-auto">
         {ingredients.length === 0 && <p className="text-sm text-text-sub text-center py-4">Aucun ingrédient</p>}
@@ -76,7 +91,7 @@ function RecetteModal({ produitId, onClose }: { produitId: string; onClose: () =
 }
 
 export default function RecettesScreen() {
-  const { matieres, produits, recettes } = useAppStore()
+  const { matieres, produits, recettes, preparationRecettes } = useAppStore()
   const [editing, setEditing] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const [search, setSearch] = useState('')
@@ -99,7 +114,7 @@ export default function RecettesScreen() {
     .sort((a, b) => a.nom.localeCompare(b.nom, 'fr'))
 
   return (
-    <div className="p-8 flex flex-col gap-6">
+    <div className="p-4 md:p-8 flex flex-col gap-6">
       <div>
         <h1 className="text-2xl font-bold text-text-main">Recettes</h1>
         <p className="text-text-sub text-sm">{recettes.length} recette(s) configurée(s)</p>
@@ -157,9 +172,43 @@ export default function RecettesScreen() {
               </div>
 
               {r && isOpen && (
-                <div className="border-t border-border bg-gray-50 px-4 py-3 flex flex-col gap-1.5">
+                <div className="border-t border-border bg-gray-50 px-4 py-3 flex flex-col gap-2">
                   {r.ingredients.map(ing => {
                     const mp = matieres.find(m => m.id === ing.matierePremiereId)
+                    const subRecette = mp?.estPreparation
+                      ? preparationRecettes.find(pr => pr.preparationId === mp.id)
+                      : null
+                    if (mp?.estPreparation) {
+                      return (
+                        <div key={ing.matierePremiereId} className="flex flex-col gap-1">
+                          {/* En-tête préparation */}
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                              <span className="text-xs bg-text-main/10 text-text-main px-2 py-0.5 rounded-full font-semibold">Prépa</span>
+                              <span className="text-sm font-semibold text-text-main">{mp.nom}</span>
+                            </div>
+                            <span className="font-semibold text-text-sub text-sm">{ing.quantite} unité{ing.quantite > 1 ? 's' : ''}</span>
+                          </div>
+                          {/* Sous-ingrédients de la préparation */}
+                          {subRecette && subRecette.ingredients.length > 0 && (
+                            <div className="ml-4 flex flex-col gap-0.5 border-l-2 border-accent/30 pl-3">
+                              {subRecette.ingredients.map(si => {
+                                const siMp = matieres.find(m => m.id === si.mpIngredientId)
+                                return (
+                                  <div key={si.mpIngredientId} className="flex items-center justify-between text-xs text-text-sub">
+                                    <span>{siMp?.nom ?? '?'}</span>
+                                    <span className="font-medium">{si.quantite * ing.quantite} {siMp?.unite.toLowerCase()}</span>
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          )}
+                          {!subRecette && (
+                            <p className="ml-4 text-xs text-warning italic">Aucune recette configurée pour cette préparation</p>
+                          )}
+                        </div>
+                      )
+                    }
                     return (
                       <div key={ing.matierePremiereId} className="flex items-center justify-between text-sm">
                         <span className="text-text-main">{mp?.nom ?? '?'}</span>

@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import Modal from '../components/Modal'
+import QuantiteInput from '../components/QuantiteInput'
 import { useAppStore } from '../store/useAppStore'
 import type { MatierePremiere, ProduitFini } from '../types'
 
@@ -26,9 +27,7 @@ function AjustMPModal({ mp, onClose }: { mp: MatierePremiere; onClose: () => voi
       </p>
       <label className="flex flex-col gap-1 text-sm font-medium">
         Quantité à ajouter (+) ou retirer (−)
-        <input type="number" value={delta} onChange={e => setDelta(e.target.value)}
-          placeholder="ex: 5000" autoFocus
-          className="border border-border rounded-lg px-3 py-2 text-sm" />
+        <QuantiteInput unite={mp.unite} value={delta} onChange={setDelta} autoFocus allowNegative />
       </label>
       <label className="flex flex-col gap-1 text-sm font-medium">
         Raison (optionnel)
@@ -165,7 +164,7 @@ export default function AccueilScreen() {
   const epuises = produits.filter(p => p.stockActuel === 0)
 
   return (
-    <div className="p-8 flex flex-col gap-6">
+    <div className="p-4 md:p-8 flex flex-col gap-6">
       <div>
         <h1 className="text-2xl font-bold text-text-main">Tableau de bord</h1>
         <p className="text-text-sub">Vue d'ensemble de votre activité</p>
