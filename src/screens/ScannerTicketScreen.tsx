@@ -17,10 +17,10 @@ interface ParsedLigne {
   ignore: boolean
 }
 
-// Détecte et extrait la quantité + unité d'un texte de ticket de caisse
+// Détecte et extrait la quantité + unité depuis un texte (ticket ou facture)
 function extractQteUnite(text: string): { quantite: number; unite: Unite; reste: string } {
-  // Pattern: "1.5KG", "500G", "1,5L", "33CL", "75CL", "1L", "25ML"
-  const reg = /(\d+(?:[.,]\d+)?)\s*(kg\b|g\b|litres?|l\b|ml\b|cl\b)/i
+  // Supporte: 1.5KG, 500G, 397GRS, 1,5L, 33CL, 75CL, 1L, 25ML, 1.65KG
+  const reg = /(\d+(?:[.,]\d+)?)\s*(kg\b|grs?\b|gr\b|g\b|litres?|l\b|ml\b|cl\b)/i
   const m = text.match(reg)
   if (!m) return { quantite: 1, unite: 'UNITE', reste: text }
 
@@ -30,13 +30,205 @@ function extractQteUnite(text: string): { quantite: number; unite: Unite; reste:
   let quantite = qty
 
   if (u === 'kg') unite = 'KG'
-  else if (u === 'g') unite = 'G'
+  else if (u === 'g' || u === 'gr' || u.startsWith('grs')) unite = 'G'
   else if (u === 'l' || u.startsWith('litre')) unite = 'L'
   else if (u === 'ml') unite = 'ML'
   else if (u === 'cl') { unite = 'ML'; quantite = qty * 10 }
 
   const reste = text.replace(m[0], '').trim()
   return { quantite, unite, reste }
+}
+
+// ── Normalisation OCR ────────────────────────────────────────────────────────
+// Supprime accents, met en minuscules, vire ponctuation → comparaison robuste
+function norm(s: string): string {
+  return s.toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+// Distance de Levenshtein (pour détecter les fautes OCR à 1-2 chars)
+function lev(a: string, b: string): number {
+  const m = a.length, n = b.length
+  const d: number[][] = Array.from({ length: m + 1 }, (_, i) =>
+    Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0)))
+  for (let i = 1; i <= m; i++)
+    for (let j = 1; j <= n; j++)
+      d[i][j] = a[i-1] === b[j-1] ? d[i-1][j-1] : 1 + Math.min(d[i-1][j], d[i][j-1], d[i-1][j-1])
+  return d[m][n]
+}
+
+// ── Dictionnaire tickets par enseigne ────────────────────────────────────────
+// Clé : texte normalisé (sans accent, minuscule) tel qu'il apparaît sur le ticket
+// Valeur : nom canonique de la matière première dans le stock
+//
+// Metro Cash & Carry : noms tronqués ~25 chars, MAJUSCULES, pas d'accents
+// Lidl / Carrefour   : noms plus complets mais accent souvent manquant
+// OCR Tesseract      : confond ê/e, é/e, ç/c, û/u, à/a, œ/oe, supprime tirets
+const TICKET_DICT: Record<string, string> = {
+  // ── Farines & féculents ──────────────────────────────────────────────────
+  'farine t55': 'Farine T55', 'farine t 55': 'Farine T55', 'farn t55': 'Farine T55',
+  'riz rond': 'Riz rond (dessert)', 'riz dessert': 'Riz rond (dessert)',
+  'pate kadaif': 'Pâte kadaïf', 'kadaif': 'Pâte kadaïf', 'kadaiff': 'Pâte kadaïf',
+  'perles tapioca': 'Perles de tapioca', 'tapioca': 'Perles de tapioca',
+  // ── Sucres ───────────────────────────────────────────────────────────────
+  'sucre poudre': 'Sucre en poudre', 'sucre en poud': 'Sucre en poudre',
+  'sucre perle': 'Sucre perlé', 'sucre glace': 'Sucre glace',
+  'sucre roux': 'Sucre roux', 'sucre brun': 'Sucre roux',
+  'glucose sirop': 'Glucose (sirop)', 'glucose': 'Glucose (sirop)',
+  // ── Levures & poudres ────────────────────────────────────────────────────
+  'levure boulan': 'Levure boulangère', 'levure boulangere': 'Levure boulangère',
+  'levure chimiq': 'Levure chimique', 'levure chim': 'Levure chimique',
+  'bicarbonate': 'Bicarbonate de soude', 'bicarbonate soude': 'Bicarbonate de soude',
+  'agar agar': 'Agar-agar', 'agaragar': 'Agar-agar',
+  'pectine': 'Pectine (NH)', 'pectine nh': 'Pectine (NH)',
+  'colorant rouge': 'Colorant rouge',
+  // ── Épices & arômes ──────────────────────────────────────────────────────
+  'cannelle': 'Cannelle poudre', 'canelle': 'Cannelle poudre', 'kanelle': 'Cannelle poudre',
+  'vanille extrait': 'Vanille (extrait)', 'extrait vanille': 'Vanille (extrait)',
+  'vanille': 'Vanille (extrait)',
+  // ── Matières grasses ─────────────────────────────────────────────────────
+  'beurre doux': 'Beurre doux', 'beurr doux': 'Beurre doux', 'beurre': 'Beurre doux',
+  'huile vegetale': 'Huile végétale', 'huile veg': 'Huile végétale',
+  // ── Produits laitiers ────────────────────────────────────────────────────
+  'lait entier': 'Lait entier', 'lait ent': 'Lait entier',
+  'creme liquide': 'Crème liquide 30%', 'creme liq': 'Crème liquide 30%',
+  'creme 30': 'Crème liquide 30%', 'creme fleurette': 'Crème liquide 30%',
+  'mascarpone': 'Mascarpone', 'mascarpon': 'Mascarpone', 'mascarpone it': 'Mascarpone',
+  'cream cheese': 'Cream cheese', 'creamcheese': 'Cream cheese',
+  'fromage blanc': 'Fromage blanc', 'frge blanc': 'Fromage blanc',
+  'chantilly': 'Chantilly (bombe)', 'chantill': 'Chantilly (bombe)',
+  'lait amande': "Lait d'amande", 'lait avoine': "Lait d'avoine",
+  'lait coco': 'Lait de coco',
+  // ── Œufs ─────────────────────────────────────────────────────────────────
+  'oeufs entiers': 'Œufs entiers', 'oeufs': 'Œufs entiers', 'oeuf': 'Œufs entiers',
+  'oefs': 'Œufs entiers', 'ufs': 'Œufs entiers',
+  'blancs oeufs': "Blancs d'œufs pasteurisés", 'blanc oeuf': "Blancs d'œufs pasteurisés",
+  'jaunes oeufs': "Jaunes d'œufs pasteurisés", 'jaune oeuf': "Jaunes d'œufs pasteurisés",
+  // ── Gélatine ─────────────────────────────────────────────────────────────
+  'gelatine poisson': 'Gélatine de poisson (feuilles)', 'gelatine poiss': 'Gélatine de poisson (feuilles)',
+  'feuilles gelatine': 'Gélatine de poisson (feuilles)', 'gelatine': 'Gélatine de poisson (feuilles)',
+  // ── Chocolats ────────────────────────────────────────────────────────────
+  'chocolat noir': 'Chocolat noir 70%', 'choco noir': 'Chocolat noir 70%',
+  'chocolat noir 70': 'Chocolat noir 70%', 'couverture noire': 'Chocolat noir 70%',
+  'chocolat lait': 'Chocolat au lait', 'choco lait': 'Chocolat au lait',
+  'chocolat blanc': 'Chocolat blanc', 'choco blanc': 'Chocolat blanc',
+  'couverture blanc': 'Couverture blanche', 'couv blanche': 'Couverture blanche',
+  'poudre cacao': 'Poudre de cacao', 'cacao': 'Poudre de cacao',
+  'pepites chocolat': 'Pépites de chocolat', 'pepites choco': 'Pépites de chocolat',
+  'chips chocolat': 'Pépites de chocolat',
+  'sauce chocolat': 'Sauce chocolat', 'sauce choco': 'Sauce chocolat',
+  'sauce caramel': 'Sauce caramel',
+  // ── Pâtes à tartiner & confitures ────────────────────────────────────────
+  'nutella': 'Nutella', 'nutela': 'Nutella', 'nuttella': 'Nutella',
+  'speculoos beurre': 'Speculoos beurre', 'speculo beurre': 'Speculoos beurre',
+  'pate speculoos': 'Speculoos beurre', 'pate speculos': 'Speculoos beurre',
+  'creme pistache': 'Crème pistache', 'pate pistache': 'Crème pistache',
+  'caramel beurre sale': 'Caramel beurre salé 2', 'caramel beurr sal': 'Caramel beurre salé 2',
+  'cbs': 'Caramel beurre salé 2',
+  'confiture fraise': 'Confiture fraise', 'conf fraise': 'Confiture fraise',
+  'miel': 'Miel', 'miel toutes fleurs': 'Miel',
+  'creme marrons': 'Crème de marrons', 'creme de marrons': 'Crème de marrons',
+  'lait concentre sucre': 'Lait concentré sucré', 'lait concentre': 'Lait concentré sucré',
+  'speculoos poudre': 'Spéculoos (poudre)', 'speculo poudre': 'Spéculoos (poudre)',
+  // ── Fruits secs & noix ───────────────────────────────────────────────────
+  'poudre amandes': "Poudre d'amandes", 'amandes poudre': "Poudre d'amandes",
+  'poudre d amande': "Poudre d'amandes",
+  'noix pecan': 'Noix de pécan', 'pecan': 'Noix de pécan',
+  'pistaches concassees': 'Pistaches concassées', 'pistache concass': 'Pistaches concassées',
+  'pistaches entieres': 'Pistaches entières', 'pistache entiere': 'Pistaches entières',
+  'noisettes concassees': 'Noisettes concassées', 'noisette concass': 'Noisettes concassées',
+  'amandes efilees': 'Amandes effilées', 'amandes effilees': 'Amandes effilées',
+  'noix coco rapee': 'Noix de coco râpée', 'coco rapee': 'Noix de coco râpée',
+  'coco rape': 'Noix de coco râpée',
+  'dattes': 'Dattes',
+  // ── Fruits frais & surgelés ──────────────────────────────────────────────
+  'citron frais': 'Citron (frais)', 'citrons': 'Citron (frais)',
+  'banane': 'Banane (fraîche)', 'bananes': 'Banane (fraîche)',
+  'mangue surgelee': 'Mangue surgelée', 'mangue surgel': 'Mangue surgelée',
+  'passion puree': 'Fruit de la passion (purée)', 'puree passion': 'Fruit de la passion (purée)',
+  'fraises surgelees': 'Fraises surgelées', 'fraises surgel': 'Fraises surgelées',
+  'fruits rouges surgeles': 'Fruits rouges surgelés', 'fruits rouges surgel': 'Fruits rouges surgelés',
+  'framboises surgelees': 'Framboises surgelées', 'framboises surgel': 'Framboises surgelées',
+  'myrtilles surgelees': 'Myrtilles surgelées', 'myrtilles surgel': 'Myrtilles surgelées',
+  'menthe fraiche': 'Menthe fraîche', 'menthe': 'Menthe fraîche',
+  // ── Biscuits & bases ─────────────────────────────────────────────────────
+  'biscuit cuillere': 'Biscuit cuillere', 'biscuits cuillere': 'Biscuit cuillere',
+  'boudoirs': 'Biscuit cuillere',
+  'biscuits speculoos': 'Biscuits spéculoos concasse', 'speculoos concasse': 'Biscuits spéculoos concasse',
+  'biscuits oreo': 'Biscuits Oréo', 'oreo': 'Biscuits Oréo',
+  'brioche tranchee': 'Brioche tranchée', 'brioche': 'Brioche tranchée',
+  // ── Cafés & boissons ─────────────────────────────────────────────────────
+  'cafe grains': 'Café en grains', 'cafe en grains': 'Café en grains',
+  'cafe moulu': 'Café moulu',
+  'the noir sachets': 'Thé noir (sachets)', 'the noir': 'Thé noir (sachets)',
+  'the vert sachets': 'Thé vert (sachets)', 'the vert': 'Thé vert (sachets)',
+  'poudre matcha': 'Poudre de matcha', 'matcha': 'Poudre de matcha',
+  'eau petillante': 'Eau pétillante', 'eau gazeuse': 'Eau pétillante',
+  // ── Sirops Monin ─────────────────────────────────────────────────────────
+  'sirop vanille': 'Sirop vanille (café)', 'monin vanille': 'Sirop vanille (café)',
+  'sirop caramel': 'Sirop caramel (café)', 'monin caramel': 'Sirop caramel (café)',
+  'sirop noisette': 'Sirop noisette (café)', 'monin noisette': 'Sirop noisette (café)',
+  'sirop speculoos': 'Sirop spéculoos (Monin)', 'monin speculoos': 'Sirop spéculoos (Monin)',
+  'sirop litchi': 'Sirop litchi (Monin)', 'monin litchi': 'Sirop litchi (Monin)',
+  'sirop rose': 'Sirop rose (Monin)', 'sirop framboise': 'Sirop framboise (Monin)',
+  'sirop peche': 'Sirop pêche (Monin)', 'sirop mojito': 'Sirop mojito (Monin)',
+  'sirop cola': 'Sirop cola (Monin)',
+  // ── Erreurs OCR fréquentes (Tesseract sur tickets thermiques) ────────────
+  'crapes': 'Crème liquide 30%',   // "CRAPES" → probablement "CRÈME" tronquée
+  'creames': 'Crème liquide 30%',
+  'mascarpon ': 'Mascarpone',
+  'frge bl': 'Fromage blanc',
+  'chantill ': 'Chantilly (bombe)',
+  'canell ': 'Cannelle poudre',
+  'speculo ': 'Spéculoos (poudre)',
+  'nuttela': 'Nutella', 'nutel': 'Nutella',
+  'couv noir': 'Chocolat noir 70%', 'couv lait': 'Chocolat au lait',
+  'pist concass': 'Pistaches concassées', 'nois concass': 'Noisettes concassées',
+  'amd efilees': 'Amandes effilées',
+  'frse surgel': 'Fraises surgelées', 'frbs surgel': 'Framboises surgelées',
+}
+
+// Cherche la meilleure correspondance MP avec normalisation + Levenshtein
+function findMatchingMP(nom: string, rawMPs: MatierePremiere[]): MatierePremiere | undefined {
+  const n = norm(nom)
+
+  // 1. Dictionnaire exact (ticket alias)
+  const alias = TICKET_DICT[n]
+  if (alias) {
+    const found = rawMPs.find(m => norm(m.nom) === norm(alias))
+    if (found) return found
+  }
+
+  // 2. Correspondance exacte normalisée
+  const exact = rawMPs.find(m => norm(m.nom) === n)
+  if (exact) return exact
+
+  // 3. Correspondance par inclusion de tokens (2+ mots communs de ≥3 chars)
+  const tokens = n.split(' ').filter(w => w.length >= 3)
+  const scored = rawMPs.map(m => {
+    const mt = norm(m.nom).split(' ').filter(w => w.length >= 3)
+    const hits = tokens.filter(w =>
+      mt.some(mw => mw === w || mw.includes(w) || w.includes(mw) || (w.length >= 5 && lev(w, mw) <= 1))
+    ).length
+    return { m, hits }
+  }).filter(x => x.hits > 0).sort((a, b) => b.hits - a.hits)
+
+  if (scored[0]?.hits >= 2) return scored[0].m
+  if (scored[0]?.hits >= 1 && tokens.length <= 2) return scored[0].m
+
+  // 4. Levenshtein global sur nom court (≤12 chars)
+  if (n.length <= 12) {
+    const fuzzy = rawMPs
+      .map(m => ({ m, d: lev(n, norm(m.nom)) }))
+      .filter(x => x.d <= 2)
+      .sort((a, b) => a.d - b.d)
+    if (fuzzy[0]) return fuzzy[0].m
+  }
+
+  return undefined
 }
 
 // Conversion d'unité lors de l'ajout au stock (ex: ticket KG → MP en G)
@@ -50,63 +242,167 @@ function convertQte(qte: number, from: Unite, to: Unite): number {
   return qte
 }
 
-// Lignes à ignorer sur un ticket de caisse
+// Lignes à ignorer systématiquement
 const SKIP_RE = [
-  /^(total|tva|net\s+à|ttc|remise|dont|sous[\s-]total|ticket|merci|bienvenu|caissier|magasin|adresse|date|heure|siret|tel|fax|www\.|http|n°|numéro|facture|avoir|bon|point|fidelité)/i,
-  /^[\s*\-=_]{3,}$/,
-  /^\d{4,}\s/, // code-barres ou article
-  /^\d{1,3}[.,]\d{2}\s*[€%]?\s*$/, // juste un prix
+  /^(total\b|tva\b|net\s+à|ttc\b|remise\b|dont\b|sous[\s-]total|ticket\b|merci\b|bienvenu|caissier|magasin|adresse|date\b|heure\b|siret\b|tel\b|fax\b|www\.|http)/i,
+  /^(avoir\b|bon\s+de|point|fidelité|n°\s+client|numéro\s+de|réf\.?\s|désignation\s|qté?\.?\s|unit\.\s|p\.u\.|mont\.?\s|livraison\b|ht\b|page\b|commande\b|client\b)/i,
+  // Sous-lignes Metro Cash & Carry
+  /^(mm\s+ean|article\s+de\s+l'article|prix\s+au\s+kg|n°\s*gtin|_best_before|offre\s+achetez|lot[_-]nr|lotid|bbd\b|ean\s+numéro)/i,
+  /^\*{3}\s+/,                           // *** CATEGORY Total: X,XX
+  /^\d{1,3}[.,]\d{2}\s*[€%]?\s*$/,      // prix seul
+  /^[\s*\-=_]{3,}$/,                     // séparateurs
 ]
+
+// Ligne trop bruitée (> 60% de tokens courts non-numériques et non-acronymes)
+function isGarbled(line: string): boolean {
+  const words = line.replace(/[;:|]/g, ' ').split(/\s+/).filter(w => w.length > 0)
+  if (words.length < 4) return false
+  const noise = words.filter(w => w.length <= 2 && !/^\d+$/.test(w) && !/^[A-Z]{1,2}$/.test(w)).length
+  return noise / words.length > 0.6
+}
+
+// Pattern facture/fournisseur : "50/Paquet", "125/Pièces", "1/Litre" etc.
+const PACK_REG = /(\d+(?:[.,]\d+)?)\s*\/\s*(paquet|pièces?|pcs?|litres?|kg\b|g\b|ml\b|cl\b)/i
+
+// Extrait le nom produit d'une ligne de facture avec colonnes
+function cleanInvoiceNom(raw: string): string {
+  const parts = raw.split('|').map(p => p.trim()).filter(p => p.length > 1)
+  const scored = parts.map(p => {
+    const clean = p.replace(/^[A-Z0-9.]{3,12}\s*/i, '').trim()
+    const score = clean.split(/\s+/).filter(w => /[a-zA-ZéàèêëîïôùûüœçÀÉÈÊÇÔÛ]{3,}/.test(w)).length * clean.length
+    return { clean, score }
+  })
+  const best = scored.sort((a, b) => b.score - a.score)[0]
+  const nom = best?.score > 0 ? best.clean : raw.replace(/\|/g, ' ')
+  return nom
+    .replace(/^[a-zéàè]{1,3}\s+/i, '')
+    .replace(/^[-—\s]+|[-—\s]+$/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+}
+
+// Déduit les unités totales commandées depuis (total_montant / prix_unitaire)
+// Utile pour les factures Metro où l'OCR fusionne les colonnes qté × colisage
+function deduireQteMetro(tokens: number[], price: number): number {
+  if (price <= 0) return 1
+  for (const t of [...tokens].reverse()) {
+    for (const cand of [t, t / 100]) {
+      if (cand < price * 0.8 || cand > price * 200) continue
+      const ratio = cand / price
+      if (Math.abs(ratio - Math.round(ratio)) < 0.08 && Math.round(ratio) >= 1) {
+        return Math.round(ratio)
+      }
+    }
+  }
+  return 1
+}
 
 function parseOCRText(text: string, rawMPs: MatierePremiere[]): ParsedLigne[] {
   const lines = text.split('\n').map(l => l.trim())
-  const result: ParsedLigne[] = []
-  let id = 0
+  const interim: { rawText: string; nom: string; quantite: number; unite: Unite; mpId: string; ignore: boolean }[] = []
 
   for (const line of lines) {
-    if (line.length < 4) continue
+    if (line.length < 5) continue
     if (SKIP_RE.some(re => re.test(line))) continue
+    if (isGarbled(line)) continue
 
-    // Enlever le prix en fin de ligne (ex: "1.89", "1,89 €", "1.89 A")
-    let nom = line.replace(/\s+\d+[.,]\d{2}\s*[€A-Z]?\s*$/, '').trim()
-    // Enlever un compteur en début "2 BEURRE..." ou "1× FARINE..."
-    nom = nom.replace(/^\d+\s*[x×]?\s+/, '').trim()
-    // Enlever les artefacts OCR courants
-    nom = nom.replace(/[|_]{2,}/g, ' ').replace(/\s{2,}/g, ' ').trim()
+    let nom = ''
+    let quantite = 1
+    let unite: Unite = 'UNITE'
 
-    const { quantite, unite, reste } = extractQteUnite(nom)
-    nom = reste
-      .replace(/\s{2,}/g, ' ')
-      .replace(/^[-*\s.]+|[-*\s.]+$/g, '')
-      .trim()
+    // Supprimer artefacts OCR en début de ligne (; : | .)
+    const cleaned = line.replace(/^[;:|.\s]+/, '').trim()
+
+    // ── Format Metro Cash & Carry : ligne commence par EAN 12-14 chiffres ──
+    const eanMatch = cleaned.match(/^(\d{12,14})\s+(\d{4,8})\s+(.+)$/)
+    if (eanMatch) {
+      const rest = eanMatch[3].trim()
+      // Prix unitaire = premier X,XXX (3 décimales — format Metro)
+      const priceMatch = rest.match(/\b(\d+)[,.](\d{3})\b/)
+      if (!priceMatch) continue
+      const price = parseFloat(priceMatch[1] + '.' + priceMatch[2])
+      const namePart = rest.substring(0, rest.indexOf(priceMatch[0])).trim()
+      const afterPart = rest.substring(rest.indexOf(priceMatch[0]) + priceMatch[0].length)
+
+      // Tokens numériques après le prix (Qté / Colisage / Montant / Code TVA)
+      const numTokens = afterPart
+        .replace(/\s+[A-Z]\s*$/, '')   // retire lettre finale (code TVA : B, D, P…)
+        .split(/\s+/)
+        .map(t => parseFloat(t.replace(',', '.')))
+        .filter(n => !isNaN(n) && n > 0)
+
+      const totalUnits = deduireQteMetro(numTokens, price)
+
+      // Taille depuis le nom (ex: 750G, 33CL, 1KG, 1.65KG, 5L)
+      const { quantite: sizeQte, unite: sizeUnite, reste: nomSans } = extractQteUnite(namePart)
+      quantite = Math.max(1, totalUnits * (sizeUnite !== 'UNITE' ? sizeQte : 1))
+      unite = sizeUnite !== 'UNITE' ? sizeUnite : 'UNITE'
+      if (unite === 'UNITE') quantite = Math.max(1, totalUnits)
+
+      nom = nomSans
+        .replace(/\s*X\d+\s*/gi, ' ')  // retire X6, X2, X12…
+        .replace(/\s{2,}/g, ' ')
+        .trim()
+
+    // ── Format facture fournisseur : N/Paquet, N/Pièces ──────────────────
+    } else {
+      const packMatch = cleaned.match(PACK_REG)
+      if (packMatch) {
+        const packSize = parseFloat(packMatch[1].replace(',', '.'))
+        const packUnit = packMatch[2].toLowerCase()
+        if (packUnit.startsWith('kg'))     unite = 'KG'
+        else if (packUnit === 'g')         unite = 'G'
+        else if (packUnit.startsWith('litre') || packUnit === 'l') unite = 'L'
+        else if (packUnit === 'ml')        unite = 'ML'
+        else if (packUnit === 'cl')        { unite = 'ML' }
+
+        const beforePack = cleaned.substring(0, cleaned.indexOf(packMatch[0]))
+        const qteMatch = beforePack.match(/(\d+)[,.](\d{2})\s*[|]?\s*$/)
+                      ?? beforePack.match(/\b(\d+)[,.](\d{2})\b/)
+        const orderedQte = qteMatch ? parseFloat(qteMatch[1] + '.' + qteMatch[2]) : 1
+        let totalQte = packSize * orderedQte
+        if (packUnit === 'cl') totalQte *= 10
+        quantite = Math.max(1, Math.round(totalQte))
+        const namePart = qteMatch
+          ? beforePack.substring(0, beforePack.lastIndexOf(qteMatch[0]))
+          : beforePack
+        nom = cleanInvoiceNom(namePart)
+
+      // ── Format ticket de caisse standard ─────────────────────────────
+      } else {
+        let raw2 = cleaned
+        raw2 = raw2.replace(/\s+\d+[.,]\d{2}\s*[€A-Z]?\s*$/, '').trim()
+        raw2 = raw2.replace(/^\d+\s*[x×]?\s+/, '').trim()
+        raw2 = raw2.replace(/[|]+/g, ' ').replace(/\s{2,}/g, ' ').trim()
+        const { quantite: q, unite: u, reste } = extractQteUnite(raw2)
+        quantite = q
+        unite = u
+        nom = reste.replace(/^[-*\s.]+|[-*\s.]+$/g, '').trim()
+      }
+    }
 
     if (nom.length < 3) continue
 
-    // Correspondance floue avec les MPs existantes
-    const nl = nom.toLowerCase()
-    const mots = nl.split(/\s+/).filter(w => w.length >= 3)
-    const best = rawMPs.find(m => {
-      const ml = m.nom.toLowerCase()
-      const motsMp = ml.split(/\s+/)
-      return (
-        ml === nl ||
-        mots.some(w => ml.includes(w)) ||
-        motsMp.some(w => w.length >= 4 && nl.includes(w))
-      )
-    })
+    // Correspondance intelligente : dictionnaire tickets + Levenshtein
+    const best = findMatchingMP(nom, rawMPs)
 
-    result.push({
-      id: id++,
-      rawText: line,
-      nom,
-      quantite,
-      unite,
-      mpId: best?.id ?? '',
-      ignore: false,
-    })
+    interim.push({ rawText: line, nom, quantite, unite, mpId: best?.id ?? '', ignore: false })
   }
 
-  return result
+  // ── Déduplication : fusionner les doublons (même nom + même unité) ────
+  const dedupMap = new Map<string, typeof interim[0]>()
+  for (const l of interim) {
+    const key = l.nom.toLowerCase().trim() + '|' + l.unite
+    const existing = dedupMap.get(key)
+    if (existing) {
+      existing.quantite += l.quantite
+      if (existing.rawText.length < 120) existing.rawText += ' + ' + l.rawText
+    } else {
+      dedupMap.set(key, { ...l })
+    }
+  }
+
+  return Array.from(dedupMap.values()).map((l, i) => ({ ...l, id: i }))
 }
 
 export default function ScannerTicketScreen() {
