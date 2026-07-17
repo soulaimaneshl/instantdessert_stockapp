@@ -259,9 +259,14 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
     const commandesSite = [...commandesB2C, ...commandesB2B].sort((a, b) => b.createdAt - a.createdAt)
 
-    // Auto-restauration des commandes annulées par le site (stock déduit lors de la préparation)
+    // Afficher l'UI immédiatement, restauration du stock en arrière-plan
+    set({ matieres: [...matieres], produits: [...produits], recettes, preparationRecettes, productions, mouvements, commandes, commandesSite, loading: false })
+
+    // Auto-restauration des commandes annulées (ne bloque plus le chargement)
+    const annulees = commandesSite.filter(c => ['annulee', 'annule'].includes(c.statut))
+    if (annulees.length === 0) return
     const restoredRaisons = new Set<string>()
-    for (const cmd of commandesSite.filter(c => ['annulee', 'annule'].includes(c.statut))) {
+    for (const cmd of annulees) {
       const raison = `Commande site #${cmd.id.slice(0, 8)}`
       const relatedMvts = mouvements.filter(m => m.raison === raison && m.delta < 0)
       if (relatedMvts.length === 0) continue
@@ -285,9 +290,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
       await supabase.from('mouvements_stock').delete().eq('raison', raison).lt('delta', 0)
       restoredRaisons.add(raison)
     }
-    const mouvementsFinal = mouvements.filter(m => !(restoredRaisons.has(m.raison ?? '') && m.delta < 0))
-    // Les commandes annulées restent visibles pour traçabilité (stock déjà restauré ci-dessus)
-    set({ matieres, produits, recettes, preparationRecettes, productions, mouvements: mouvementsFinal, commandes, commandesSite, loading: false })
+    if (restoredRaisons.size > 0) {
+      const mouvementsFinal = mouvements.filter(m => !(restoredRaisons.has(m.raison ?? '') && m.delta < 0))
+      set({ matieres: [...matieres], produits: [...produits], mouvements: mouvementsFinal })
+    }
   },
 
   saveMatiere: async (data) => {
